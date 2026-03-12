@@ -1,0 +1,14 @@
+REPORT:
+  Funcionalidades:
+	- Protocolo MQTT;
+	- Cria controlo automático;
+	- Funcionalidade de RESET com interação visual (LED);
+	- Protocolo de conexão dos módulos;
+	- Reconexão automática;
+	- Em caso de falha, quer da internet, do módulo com sensor ou o raspberry falhem o protocolo FAILSAFE desliga o relé ao fim de 5 minutos por segurança até que o módulo seja substituído ou consertado;
+	- Código dos módulos com esp32 e DHT11 replicáveis;
+	- Código dos módulos com esp32 e Drele replicáveis;
+
+
+  CORRIGIR:
+	- Controlo não aparece automaticamente;
