@@ -1,0 +1,20 @@
+Guia de utilização smart home (kit com raspberry Pi e possivelmente um módulo inicial):
+
+- Alimentar o Raspberry,
+- Instalar App "Home Assistant",
+- Criar uma conta,
+- Ir a "Configurações > Pessoas" para adicionar a família.
+
+
+Guia de utilização módulo:
+
+(1) Instalação:
+	a. Alimentar o módulo;
+	b. Conectar á rede "nome do módulo";
+	c. Conectar á rede pretendida (Introduzir o nome da rede e a respetiva password);
+	d. Definir o nome que quer dar ao módulo (ex. Tomada Quarto 1)
+	_ Testar se quando o utilizador cria a conta e acede, se o controlo do modulo aparece logo ou se tem de adicionar uma nova entidade_
+
+(2) Reset á rede/nome do módulo:
+	- Premir o botão durante 5s (O led vai começar a piscar assim que começar a pressionar, vai piscar cada vez mais rápido até passarem 5s e eventualmente deixa de piscar e fica ligado)
+	- Espere ate que led volte a piscar de forma ininterrupta, de seguida repita (1) a partir do ponto "b.".
