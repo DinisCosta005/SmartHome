@@ -1,0 +1,217 @@
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <ESPmDNS.h>
+#include <PubSubClient.h>
+#include <esp_task_wdt.h>
+#include <ArduinoJson.h>
+
+#define WDT_TIMEOUT 10
+#define RELAY_PIN 23
+#define LED_PIN 14
+#define RESET_BUTTON_PIN 4
+#define FAILSAFE_TIMEOUT 300000 // 5 minutos
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+WiFiManager wm;
+
+const char* mqtt_user = "esp_mqtt";
+const char* mqtt_pass = "projeto123";
+const char* topicState = "casa/central/rele/state";
+const char* topicCmd = "casa/central/rele/set";
+const char* topicAvailability = "casa/central/rele/availability";
+
+unsigned long lastReconnectAttempt = 0;
+unsigned long tempoBotaoPressionado = 0;
+unsigned long ultimoPisca = 0;
+unsigned long ultimoTempoConectado = 0; // CORREÇÃO: Cronómetro real do Failsafe
+bool estadoLed = false;
+const int tempoParaReset = 5000;
+
+// ---------------------------------------------------------
+// FUNÇÃO DE DESCOBERTA
+// ---------------------------------------------------------
+void enviarConfiguracaoDiscoveryRele() {
+  // Gera ID único baseado no hardware (MAC Address)
+  String chipID = WiFi.macAddress();
+  chipID.replace(":", ""); 
+
+  // Tópico de configuração único para esta placa
+  String discoveryTopic = "homeassistant/switch/smartclima_central_" + chipID + "/config";
+  
+  DynamicJsonDocument doc(1024);
+  doc["name"] = "Relé Caldeira Central";
+  doc["has_entity_name"] = true; // Permite que o HA use o nome do Dispositivo
+  doc["stat_t"] = topicState;
+  doc["cmd_t"] = topicCmd;
+  doc["uniq_id"] = "smartclima_rele_" + chipID; // ID único para a entidade
+  doc["pl_on"] = "ON";
+  doc["pl_off"] = "OFF";
+
+  doc["avty_t"] = topicAvailability;
+  doc["pl_avail"] = "online";
+  doc["pl_not_avail"] = "offline";
+  
+  // Agrupa como um Dispositivo no HA (fica muito mais organizado)
+  JsonObject device = doc.createNestedObject("device");
+  JsonArray ids = device.createNestedArray("ids");
+  ids.add("smartclima_central_" + chipID);
+  device["name"] = "SmartClima Central";
+  device["mf"] = "SmartHome PT";
+  device["mdl"] = "Módulo de Relé";
+
+  String payload;
+  serializeJson(doc, payload);
+  client.publish(discoveryTopic.c_str(), payload.c_str(), true);
+}
+
+// ---------------------------------------------------------
+// CALLBACK: RECEBE OS COMANDOS ON/OFF DO HOME ASSISTANT
+// ---------------------------------------------------------
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message;
+  for (int i = 0; i < length; i++) message += (char)payload[i];
+
+  if (String(topic) == topicCmd) {
+    if (message == "ON") {
+      digitalWrite(RELAY_PIN, LOW);
+      client.publish(topicState, "ON", true);
+    } else if (message == "OFF") {
+      digitalWrite(RELAY_PIN, HIGH);
+      client.publish(topicState, "OFF", true);
+    }
+  }
+}
+
+// ---------------------------------------------------------
+// RECONEXÃO MQTT NÃO-BLOQUEANTE
+// ---------------------------------------------------------
+boolean reconnect() {
+  if (!client.connected()) {
+    String chipID = WiFi.macAddress();
+    chipID.replace(":", "");
+    String clientId = "ESP32_Central_" + chipID;
+
+    IPAddress serverIP = MDNS.queryHost("homeassistant");
+    client.setServer((serverIP.toString() != "0.0.0.0") ? serverIP : IPAddress(192, 168, 1, 76), 1883);
+
+    // --- MAGIA AQUI: Ligação com LWT configurado ---
+    if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass, topicAvailability, 0, true, "offline")) {
+      
+      // Avisa o HA que a central está viva!
+      client.publish(topicAvailability, "online", true);
+      // -----------------------------------------------
+
+      enviarConfiguracaoDiscoveryRele(); 
+      client.subscribe(topicCmd);
+      
+      String currentState = (digitalRead(RELAY_PIN) == LOW) ? "ON" : "OFF";
+      client.publish(topicState, currentState.c_str(), true);
+      
+      ultimoTempoConectado = millis();
+      return true;
+    }
+  }
+  return client.connected();
+}
+
+// ---------------------------------------------------------
+// SETUP
+// ---------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);  // Garante que arranca DESLIGADO (Assumindo Activo-LOW)
+
+  WiFi.mode(WIFI_STA);
+  wm.setConfigPortalBlocking(false);
+
+  wm.setConnectTimeout(8);
+
+  wm.autoConnect("SmartClima_Central");
+
+  MDNS.begin("smartclima-central");
+  client.setBufferSize(1024);
+  client.setCallback(callback);
+
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WDT_TIMEOUT * 1000, 
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1, 
+    .trigger_panic = true
+  };
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL);
+}
+
+// ---------------------------------------------------------
+// LOOP
+// ---------------------------------------------------------
+void loop() {
+  esp_task_wdt_reset();
+  wm.process();
+  unsigned long now = millis();
+
+  bool isResetting = (digitalRead(RESET_BUTTON_PIN) == LOW);
+
+  // 1. LÓGICA DE RESET (Prioridade)
+  if (isResetting) {
+    if (tempoBotaoPressionado == 0) tempoBotaoPressionado = now;
+    unsigned long decorrido = now - tempoBotaoPressionado;
+
+    int intervalo = map(decorrido, 0, tempoParaReset, 500, 50);
+    if (now - ultimoPisca > intervalo) {
+      ultimoPisca = now;
+      estadoLed = !estadoLed;
+      digitalWrite(LED_PIN, estadoLed);
+    }
+
+    if (decorrido > tempoParaReset) {
+      digitalWrite(LED_PIN, HIGH);
+      wm.resetSettings();
+      delay(2000);
+      ESP.restart();
+    }
+  } else {
+    tempoBotaoPressionado = 0;
+
+    // 2. LÓGICA DO LED NORMAL
+    if (wm.getConfigPortalActive() || WiFi.status() != WL_CONNECTED) {
+      if (now - ultimoPisca > 500) {
+        ultimoPisca = now;
+        estadoLed = !estadoLed;
+        digitalWrite(LED_PIN, estadoLed);
+      }
+    } else if (WiFi.status() == WL_CONNECTED) {
+      digitalWrite(LED_PIN, client.connected() ? HIGH : LOW);
+    }
+  }
+
+  // 3. CONECTIVIDADE E FAILSAFE VERDADEIRO
+  if (WiFi.status() == WL_CONNECTED) {
+    if (client.connected()) {
+      ultimoTempoConectado = now; // Atualiza constantemente enquanto o MQTT está vivo
+      client.loop();
+    } else {
+      // Se não está conectado, tenta ligar a cada 5 segundos
+      if (now - lastReconnectAttempt > 5000) {
+        lastReconnectAttempt = now;
+        reconnect();
+      }
+      
+      // FAILSAFE: Se o relé está ligado E já passou o timeout desde a última vez que o MQTT esteve vivo
+      if (digitalRead(RELAY_PIN) == LOW && (now - ultimoTempoConectado > FAILSAFE_TIMEOUT)) {
+        digitalWrite(RELAY_PIN, HIGH); // Força OFF (Active-LOW)
+        Serial.println("FAILSAFE: Servidor MQTT em baixo há 5 minutos. Caldeira desligada por segurança.");
+      }
+    }
+  } else {
+      // FAILSAFE DUPLO: Se o Wi-Fi falhar por completo, também usamos o Failsafe
+      if (digitalRead(RELAY_PIN) == LOW && (now - ultimoTempoConectado > FAILSAFE_TIMEOUT)) {
+        digitalWrite(RELAY_PIN, HIGH);
+        Serial.println("FAILSAFE: Wi-Fi em baixo há 5 minutos. Caldeira desligada.");
+      }
+  }
+}

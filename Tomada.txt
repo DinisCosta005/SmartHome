@@ -1,0 +1,275 @@
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <ESPmDNS.h>
+#include <PubSubClient.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+#include <esp_task_wdt.h>
+
+// --- Configuração de Hardware ---
+#define WDT_TIMEOUT 10
+#define RELAY_PIN 5
+#define LED_PIN 23
+#define RESET_BUTTON_PIN 4
+#define FAILSAFE_TIMEOUT 300000  // 5 minutos sem sinal = Desliga
+
+Preferences preferences;
+WiFiClient espClient;
+PubSubClient client(espClient);
+WiFiManager wm;
+
+// --- Variáveis de Sistema ---
+String deviceName = "Tomada_C6";
+String topicState, topicCmd, topicAvailability;
+
+unsigned long lastMsgTime = 0;
+unsigned long lastReconnectAttempt = 0;
+unsigned long tempoBotaoPressionado = 0;
+unsigned long ultimoPisca = 0;
+bool estadoLed = false;
+const int tempoParaReset = 5000;
+
+// Parâmetro para o Portal WiFiManager
+WiFiManagerParameter custom_device_name("device", "Nome da tomada (ex: Frigorifico)", "", 40);
+
+// ---------------------------------------------------------
+// CALLBACK: GUARDA PARÂMETROS E REINICIA
+// ---------------------------------------------------------
+void saveParamsCallback() {
+  String novoNome = String(custom_device_name.getValue());
+  if (novoNome != "" && novoNome != deviceName) {
+    preferences.begin("plug_cfg", false);          // CORRIGIDO: Mesmo namespace do setup()
+    preferences.putString("deviceName", novoNome); // CORRIGIDO: Mesma chave do setup()
+    preferences.end();
+    Serial.println("Novo nome guardado: " + novoNome + ". A reiniciar...");
+    delay(1000);
+    ESP.restart();  // Reinicia para atualizar os tópicos MQTT com o novo nome
+  }
+}
+
+// ---------------------------------------------------------
+// CALLBACK: MODO DE CONFIGURAÇÃO (LED pisca lento)
+// ---------------------------------------------------------
+void configModeCallback(WiFiManager* myWiFiManager) {
+  Serial.println("PORTAL DE CONFIGURAÇÃO ATIVO");
+}
+
+// ---------------------------------------------------------
+// DISCOVERY: Registo automático no Home Assistant
+// ---------------------------------------------------------
+void sendDiscovery() {
+  // Novo método infalível para gerar o ID único (igual ao teu SmartClima)
+  String chipID = WiFi.macAddress();
+  chipID.replace(":", ""); 
+
+  String safeName = deviceName;
+  safeName.toLowerCase();
+  safeName.replace(" ", "_");
+  
+  // Tópico de discovery único
+  String discoveryTopic = "homeassistant/switch/" + safeName + "_" + chipID + "/config";
+
+  StaticJsonDocument<512> doc;
+  doc["name"] = nullptr; // O nome vai ser gerido pelo device
+  doc["has_entity_name"] = true;
+  doc["stat_t"] = topicState;
+  doc["cmd_t"] = topicCmd;
+  doc["payload_on"] = "ON";
+  doc["payload_off"] = "OFF";
+  
+  // --- A MAGIA ACONTECE AQUI ---
+  doc["dev_cla"] = "outlet"; // Diz ao HA que isto é uma tomada!
+  doc["avty_t"] = topicAvailability;
+  doc["pl_avail"] = "online";
+  doc["pl_not_avail"] = "offline";
+  
+  doc["uniq_id"] = "plug_" + chipID + "_" + safeName;
+  
+  // Agrupa a entidade num Dispositivo (Device) no HA
+  doc["dev"]["ids"] = "smartplug_device_" + chipID;
+  doc["dev"]["name"] = deviceName;
+  doc["dev"]["mf"] = "SmartHome PT";
+  doc["dev"]["mdl"] = "Tomada Inteligente";
+
+  char payload[512];
+  serializeJson(doc, payload);
+  client.publish(discoveryTopic.c_str(), payload, true);
+}
+
+// ---------------------------------------------------------
+// CALLBACK: Recebe comandos do HA
+// ---------------------------------------------------------
+void callback(char* topic, byte* payload, unsigned int length) {
+  lastMsgTime = millis(); // Reset de atividade
+  String message;
+  for (int i = 0; i < length; i++) message += (char)payload[i];
+
+  if (message == "ON") {
+    digitalWrite(RELAY_PIN, LOW); 
+    client.publish(topicState.c_str(), "ON", true);
+  } else if (message == "OFF") {
+    digitalWrite(RELAY_PIN, HIGH); 
+    client.publish(topicState.c_str(), "OFF", true);
+  }
+}
+
+// ---------------------------------------------------------
+// LIGAÇÃO MQTT
+// ---------------------------------------------------------
+boolean reconnect() {
+  if (!client.connected()) {
+    Serial.println("A tentar ligação MQTT...");
+    IPAddress serverIP = MDNS.queryHost("homeassistant");
+    client.setServer((serverIP.toString() != "0.0.0.0") ? serverIP : IPAddress(192, 168, 1, 76), 1883);
+
+    // Ligação com LWT (Last Will and Testament): se cair, publica "offline" no topicAvailability
+    if (client.connect(("ESP32_Sensor_" + deviceName).c_str(), "esp_mqtt", "projeto123", topicAvailability.c_str(), 0, true, "offline")) {
+      Serial.println("Ligado ao MQTT!");
+      client.publish(topicAvailability.c_str(), "online", true);
+      sendDiscovery();
+      client.subscribe(topicCmd.c_str());
+      
+      // CORRIGIDO: Informa o HA do estado REAL atual da tomada
+      String estadoAtual = (digitalRead(RELAY_PIN) == LOW) ? "ON" : "OFF";
+      client.publish(topicState.c_str(), estadoAtual.c_str(), true);
+      return true;
+    }
+    Serial.println("Falhou ligação MQTT. Nova tentativa em breve.");
+  }
+  return client.connected();
+}
+
+// ---------------------------------------------------------
+// SETUP
+// ---------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WDT_TIMEOUT * 1000,                
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1, 
+    .trigger_panic = true                            
+  };
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+
+  // SEGURANÇA: Inicia SEMPRE desligado após falta de luz
+  digitalWrite(RELAY_PIN, HIGH);
+
+  // CORRIGIDO: Lê o nome usando o mesmo namespace e chave do callback
+  preferences.begin("plug_cfg", false);
+  deviceName = preferences.getString("deviceName", "Tomada_C6"); 
+  preferences.end();
+
+  WiFi.mode(WIFI_STA);
+
+  custom_device_name.setValue(deviceName.c_str(), 40);
+  wm.addParameter(&custom_device_name);
+  wm.setSaveParamsCallback(saveParamsCallback);
+  wm.setAPCallback(configModeCallback);
+  wm.setConfigPortalBlocking(false);
+
+  Serial.println("A ligar ao WiFi ou iniciar portal AP...");
+  if (wm.autoConnect("SmartPlug_Setup")) {
+    Serial.println("Ligado ao WiFi!");
+  }
+
+  // Gera os tópicos baseados no deviceName
+  String safeTopic = deviceName;
+  safeTopic.toLowerCase();
+  safeTopic.replace(" ", "_");
+
+  // Configuração de Tópicos
+  topicState = "casa/tomada/" + safeTopic + "/state";
+  topicCmd = "casa/tomada/" + safeTopic + "/set";
+  topicAvailability = "casa/tomada/" + safeTopic + "/availability";
+
+  if (!MDNS.begin(("sensor-" + safeTopic).c_str())) {
+    Serial.println("Erro ao configurar mDNS");
+  }
+
+  client.setBufferSize(1024);
+  client.setCallback(callback);
+}
+
+// ---------------------------------------------------------
+// LOOP
+// ---------------------------------------------------------
+void loop() {
+  esp_task_wdt_reset();
+  wm.process();
+  unsigned long now = millis();
+
+  // 1. MANUTENÇÃO DA LIGAÇÃO MQTT (Independente do Failsafe)
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!client.connected()) {
+      if (now - lastReconnectAttempt > 5000) { // Tenta a cada 5s
+        lastReconnectAttempt = now;
+        reconnect();
+      }
+    } else {
+      client.loop(); // Mantém MQTT vivo
+    }
+  }
+
+  // 2. FAILSAFE DE SEGURANÇA UNIFICADO
+  // Se a tomada estiver LIGADA (LOW) e não receber ordens do HA há 5 minutos -> Desliga.
+  if (digitalRead(RELAY_PIN) == LOW && (millis() - lastMsgTime > FAILSAFE_TIMEOUT)) {
+      digitalWrite(RELAY_PIN, HIGH); // DESLIGA carga
+      if (client.connected()) {
+        client.publish(topicState.c_str(), "OFF", true);
+      }
+      Serial.println("SEGURANÇA: Comunicação com cérebro perdida há 5 min. Tomada desligada.");
+      lastMsgTime = millis(); // Evita spam no Serial
+  }
+
+  // 3. LÓGICA DO BOTÃO DE RESET E LED
+  bool isResetting = (digitalRead(RESET_BUTTON_PIN) == LOW);
+
+  if (isResetting) {
+    if (tempoBotaoPressionado == 0) tempoBotaoPressionado = now;
+    unsigned long decorrido = now - tempoBotaoPressionado;
+
+    // Pisca progressivo (de 500ms até 50ms)
+    int intervalo = map(decorrido, 0, tempoParaReset, 500, 50);
+    if (now - ultimoPisca > intervalo) {
+      ultimoPisca = now;
+      estadoLed = !estadoLed;
+      digitalWrite(LED_PIN, estadoLed);
+    }
+
+    // Passaram 5 segundos -> Factory Reset
+    if (decorrido > tempoParaReset) {
+      Serial.println("A FAZER RESET DE FÁBRICA...");
+      digitalWrite(LED_PIN, HIGH);
+      wm.resetSettings();
+      
+      // Limpa as definições usando o namespace correto
+      preferences.begin("plug_cfg", false); 
+      preferences.clear();
+      preferences.end();
+      
+      delay(1500);
+      ESP.restart();
+    }
+  } else {
+    tempoBotaoPressionado = 0;  // Reset ao contador se o botão for largado
+
+    // LÓGICA DO LED NORMAL
+    if (wm.getConfigPortalActive() || WiFi.status() != WL_CONNECTED) {
+      // Modo de Configuração AP ou sem WiFi -> Pisca Lento
+      if (now - ultimoPisca > 500) {
+        ultimoPisca = now;
+        estadoLed = !estadoLed;
+        digitalWrite(LED_PIN, estadoLed);
+      }
+    } else if (WiFi.status() == WL_CONNECTED) {
+      // Fixo se tiver MQTT, Apagado se o WiFi der mas o MQTT falhar
+      digitalWrite(LED_PIN, client.connected() ? HIGH : LOW);
+    }
+  }
+}

@@ -1,0 +1,315 @@
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <ESPmDNS.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+#include <Preferences.h>
+#include <esp_task_wdt.h>
+#include <ArduinoJson.h>
+
+#define WDT_TIMEOUT 10
+#define DHTPIN 4
+#define DHTTYPE DHT11
+#define LED_PIN 23          
+#define RESET_BUTTON_PIN 5  
+#define DHT_INTERVAL 10000 
+
+DHT dht(DHTPIN, DHTTYPE);
+Preferences preferences;
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+WiFiManager wm;
+
+String nome_da_divisao = "Divisao";
+float setpoint = 20.0;
+String currentMode = "heat";
+String topicState, topicSetpointCmd, topicModeCmd, topicAvailability;
+
+const char* mqtt_user = "esp_mqtt";
+const char* mqtt_pass = "projeto123";
+
+unsigned long lastReadTime = 0;
+unsigned long lastReconnectAttempt = 0;
+unsigned long tempoBotaoPressionado = 0;
+unsigned long ultimoPisca = 0;
+bool estadoLed = false;
+const int tempoParaReset = 5000;
+
+
+WiFiManagerParameter custom_room_name("room", "Nome da Divisao (ex: Sala)", "", 40);
+
+// ---------------------------------------------------------
+// CALLBACK: GUARDA PARÂMETROS E REINICIA
+// ---------------------------------------------------------
+void saveParamsCallback() {
+  String novoNome = String(custom_room_name.getValue());
+  if (novoNome != "" && novoNome != nome_da_divisao) {
+    preferences.begin("smartclima", false);
+    preferences.putString("nome_da_divisao", novoNome);
+    preferences.end();
+    Serial.println("Novo nome guardado: " + novoNome + ". A reiniciar...");
+    delay(1000);
+    ESP.restart();  
+  }
+}
+
+// ---------------------------------------------------------
+// CALLBACK: MODO DE CONFIGURAÇÃO (LED pisca lento)
+// ---------------------------------------------------------
+void configModeCallback(WiFiManager* myWiFiManager) {
+  Serial.println("PORTAL DE CONFIGURAÇÃO ATIVO");
+}
+
+// ---------------------------------------------------------
+// CALLBACK: RECEBE COMANDOS DO HA
+// ---------------------------------------------------------
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message;
+  for (int i = 0; i < length; i++) message += (char)payload[i];
+
+  if (String(topic) == topicSetpointCmd) {
+    setpoint = message.toFloat();
+    preferences.begin("smartclima", false); preferences.putFloat("setpoint", setpoint); preferences.end();
+  } else if (String(topic) == topicModeCmd) {
+    currentMode = message;
+    preferences.begin("smartclima", false); preferences.putString("mode", currentMode); preferences.end();
+  }
+  publishData(); 
+}
+
+void publishData() {
+  float temp = dht.readTemperature();
+  Serial.println("Temp do sensor: " + String(temp));
+  if (isnan(temp) || temp < -10 || temp > 60) {
+    String payload = "{\"temp\": null, \"setpoint\": " + String(setpoint) + ", \"mode\": \"error\"}";
+    client.publish(topicState.c_str(), payload.c_str(), true);
+    return;
+  }
+  String payload = "{\"temp\": " + String(temp) + ", \"setpoint\": " + String(setpoint) + ", \"mode\": \"" + currentMode + "\"}";
+  client.publish(topicState.c_str(), payload.c_str(), true);
+}
+
+void sendThermostatDiscovery() {
+  // Novo método infalível para gerar o ID
+  String chipID = WiFi.macAddress();
+  chipID.replace(":", ""); 
+  
+  String safeName = nome_da_divisao;
+  safeName.toLowerCase();
+  safeName.replace(" ", "_");
+  
+  String discoveryTopic = "homeassistant/climate/smartclima_" + safeName + "/config";
+
+  String payload = "{"
+                   "\"name\": null," 
+                   "\"has_entity_name\": true," 
+                   "\"object_id\": \"smartclima_" + safeName + "\","
+                   "\"modes\": [\"off\", \"heat\"],"
+                   "\"mode_cmd_t\": \"" + topicModeCmd + "\","
+                   "\"mode_stat_t\": \"" + topicState + "\","
+                   "\"mode_stat_tpl\": \"{{ value_json.mode }}\","
+                   "\"action_topic\": \"casa/central/rele/state\","
+                   "\"action_template\": \"{% if value == 'ON' %}heating{% else %}idle{% endif %}\","
+                   "\"curr_temp_t\": \"" + topicState + "\","
+                   "\"curr_temp_tpl\": \"{{ value_json.temp }}\","
+                   "\"temp_stat_t\": \"" + topicState + "\","
+                   "\"temp_stat_tpl\": \"{{ value_json.setpoint }}\","
+                   "\"temp_cmd_t\": \"" + topicSetpointCmd + "\","
+                   "\"min_temp\": 15,"
+                   "\"max_temp\": 30,"
+                   "\"temp_step\": 0.5,"
+                   "\"avty_t\": \"" + topicAvailability + "\","
+                   "\"pl_avail\": \"online\","
+                   "\"pl_not_avail\": \"offline\","
+                   "\"unique_id\": \"smartclima_tst_" + chipID + "_" + safeName + "\","
+                   "\"device\": {"
+                   "\"ids\": [\"smartclima_device_" + chipID + "\"],"
+                   "\"name\": \"SmartClima " + nome_da_divisao + "\","
+                   "\"mf\": \"SmartHome PT\""
+                   "}"
+                   "}";
+  client.publish(discoveryTopic.c_str(), (const uint8_t*)payload.c_str(), payload.length(), true);
+}
+
+boolean reconnect() {
+  if (!client.connected()) {
+    Serial.println("A procurar o Home Assistant...");
+    IPAddress serverIP = MDNS.queryHost("homeassistant");
+    client.setServer((serverIP.toString() != "0.0.0.0") ? serverIP : IPAddress(192, 168, 1, 76), 1883);
+
+    // --- MAGIA AQUI: Adicionado LWT (Last Will and Testament) ---
+    if (client.connect(("ESP_SmartClima_" + nome_da_divisao).c_str(), mqtt_user, mqtt_pass, topicAvailability.c_str(), 0, true, "offline")) {
+      Serial.println("Ligado ao MQTT!");
+      
+      // Avisa o HA que estamos online!
+      client.publish(topicAvailability.c_str(), "online", true);
+      // ----------------------------------------------------------
+
+      enviarConfiguracaoDiscoverySensor();
+      sendThermostatDiscovery();
+      client.subscribe(topicSetpointCmd.c_str());
+      client.subscribe(topicModeCmd.c_str());  
+      publishData();
+      return true;
+    }
+    Serial.println("Falhou.");
+  }
+  return client.connected();
+}
+
+void enviarConfiguracaoDiscoverySensor() {
+  // Novo método infalível para gerar o ID
+  String chipID = WiFi.macAddress();
+  chipID.replace(":", "");
+  
+  String safeName = nome_da_divisao;
+  safeName.toLowerCase();
+  safeName.replace(" ", "_");
+  
+  String discoveryTopic = "homeassistant/sensor/smartclima_temp_" + safeName + "_" + chipID + "/config";
+  
+  DynamicJsonDocument doc(1024);
+  doc["name"] = "Temperatura"; 
+  doc["has_entity_name"] = true; 
+  doc["object_id"] = "smartclima_temp_" + safeName;
+  doc["stat_t"] = topicState;              
+  doc["unit_of_meas"] = "°C";
+  doc["dev_cla"] = "temperature";
+  doc["val_tpl"] = "{{ value_json.temp }}"; 
+  doc["uniq_id"] = "smartclima_temp_" + chipID;
+
+  doc["avty_t"] = topicAvailability;
+  doc["pl_avail"] = "online";
+  doc["pl_not_avail"] = "offline";
+  
+  // Agora o sensor também sabe a que "Dispositivo" pertence
+  JsonObject device = doc.createNestedObject("device");
+  JsonArray ids = device.createNestedArray("ids");
+  ids.add("smartclima_device_" + chipID);
+  device["name"] = "SmartClima " + nome_da_divisao;
+  device["mf"] = "SmartHome PT";
+  
+  String payload;
+  serializeJson(doc, payload);
+  client.publish(discoveryTopic.c_str(), payload.c_str(), true); 
+}
+void setup() {
+  Serial.begin(115200);
+
+  dht.begin();
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+
+  preferences.begin("smartclima", false);
+  nome_da_divisao = preferences.getString("nome_da_divisao", nome_da_divisao);
+  setpoint = preferences.getFloat("setpoint", 20.0);
+  currentMode = preferences.getString("mode", "heat");
+  preferences.end();
+
+  WiFi.mode(WIFI_STA);  
+
+  custom_room_name.setValue(nome_da_divisao.c_str(), 40);
+  wm.addParameter(&custom_room_name);
+  wm.setSaveParamsCallback(saveParamsCallback);
+  wm.setConfigPortalBlocking(false);
+
+  wm.setConnectTimeout(8);
+
+  Serial.println("A ligar ao WiFi ou iniciar portal AP...");
+  if (wm.autoConnect("SmartClima_DHT11")) {
+    Serial.println("Ligado ao WiFi!");
+  }
+
+  // Gera os tópicos baseados no nome_da_divisao
+  String safeTopic = nome_da_divisao;
+  safeTopic.toLowerCase();
+  safeTopic.replace(" ", "_");
+
+  topicState = "casa/" + safeTopic + "/state";
+  topicSetpointCmd = "casa/" + safeTopic + "/setpoint/set";
+  topicModeCmd = "casa/" + safeTopic + "/mode/set";
+  topicAvailability = "casa/" + safeTopic + "/availability";
+
+  if (!MDNS.begin(("sensor-" + safeTopic).c_str())) {
+    Serial.println("Erro ao configurar mDNS");
+  }
+
+  client.setBufferSize(2048);
+  client.setCallback(callback);
+
+  esp_task_wdt_deinit(); 
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WDT_TIMEOUT * 1000, 
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1, 
+    .trigger_panic = true
+  };
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL);
+}
+
+void loop() {
+
+  esp_task_wdt_reset();
+  wm.process();
+  unsigned long now = millis();
+
+  bool isResetting = (digitalRead(RESET_BUTTON_PIN) == LOW);
+
+  // 1. LÓGICA DO BOTÃO DE RESET (Prioridade Máxima)
+  if (isResetting) {
+    if (tempoBotaoPressionado == 0) tempoBotaoPressionado = now;
+    unsigned long decorrido = now - tempoBotaoPressionado;
+
+    // Pisca progressivo (de 500ms até 50ms)
+    int intervalo = map(decorrido, 0, tempoParaReset, 500, 50);
+    if (now - ultimoPisca > intervalo) {
+      ultimoPisca = now;
+      estadoLed = !estadoLed;
+      digitalWrite(LED_PIN, estadoLed);
+    }
+
+    // Passaram 5 segundos -> Factory Reset
+    if (decorrido > tempoParaReset) {
+      Serial.println("A FAZER RESET DE FÁBRICA...");
+      digitalWrite(LED_PIN, HIGH);
+      wm.resetSettings();
+      preferences.begin("smartclima", false);
+      preferences.clear();
+      preferences.end();
+      delay(1500);
+      ESP.restart();
+    }
+  } else {
+    tempoBotaoPressionado = 0;  // Reset ao contador se o botão for largado
+
+    // 2. LÓGICA DO LED NORMAL
+    if (wm.getConfigPortalActive() || WiFi.status() != WL_CONNECTED) {
+      // Modo de Configuração AP ou sem WiFi -> Pisca Lento
+      if (now - ultimoPisca > 500) {
+        ultimoPisca = now;
+        estadoLed = !estadoLed;
+        digitalWrite(LED_PIN, estadoLed);
+      }
+    } else if (WiFi.status() == WL_CONNECTED) {
+      // Fixo se tiver MQTT, Apagado se o WiFi der mas o MQTT falhar
+      digitalWrite(LED_PIN, client.connected() ? HIGH : LOW);
+    }
+  }
+
+  // 3. GESTÃO DO MQTT E SENSORES (Apenas se não estivermos a dar reset)
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!client.connected()) {
+      if (now - lastReconnectAttempt > 5000) {
+        lastReconnectAttempt = now;
+        reconnect();
+      }
+    } else {
+      client.loop();
+      if (now - lastReadTime > DHT_INTERVAL) {
+        lastReadTime = now;
+        publishData();
+      }
+    }
+  }
+}
